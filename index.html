@@ -197,61 +197,72 @@ function pdfMoney(v){if(v==null)return 0;return Math.abs(parseFloat(String(v).re
 function parseFlagstarMeta(fullText){if(!/Flagstar Bank|www\.flagstar\.com|HICKSVILLE/i.test(fullText))return null;let grab=(re,i=1)=>{let m=fullText.match(re);return m?m[i]:null},begin=grab(/Beginning Balance\s+\$?([\d,]+\.\d{2})/i),end=grab(/Ending Balance\s+\$?([\d,]+\.\d{2})/i),cr=fullText.match(/(\d+)\s+Credit\(s\)\s+This Period\s+\$?([\d,]+\.\d{2})/i),dr=fullText.match(/(\d+)\s+Debit\(s\)\s+This Period\s+\$?([\d,]+\.\d{2})/i),period=grab(/Statement Ending\s+(\d{2}\/\d{2}\/\d{4})/i),bd=fullText.match(/(\d{2}\/\d{2}\/\d{4})\s+Beginning Balance/i),ed=fullText.match(/(\d{2}\/\d{2}\/\d{4})\s+Ending Balance/i),iso=s=>s?`${s.slice(6,10)}-${s.slice(0,2)}-${s.slice(3,5)}`:'';if(!cr||!dr)return null;return{bank:'Flagstar Bank',period:period?`Statement Ending ${period}`:'Flagstar Statement',beginningDate:iso(bd?.[1]||''),endingDate:iso(ed?.[1]||period||''),beginningBalance:pdfMoney(begin),endingBalance:pdfMoney(end),expected:{creditCount:+cr[1],creditTotal:pdfMoney(cr[2]),debitCount:+dr[1],debitTotal:pdfMoney(dr[2])}}}
 function makePdfRow(date,desc,ref,type,amount,raw){let fp=fingerprint(date,desc,amount),category=type==='Income'?(db.categories.Income.includes('Uncategorized Income')?'Uncategorized Income':db.categories.Income[0]):(db.categories.Expense.includes('Uncategorized Expense')?'Uncategorized Expense':db.categories.Expense[0]);return{id:'pdf'+Math.random().toString(36).slice(2,9),date,desc,ref:ref||'',type,amount,category,event:'',approve:amount>0,duplicate:db.fingerprints.includes(fp),fp,raw}}
 function parseFlagstarTransactions(lines,fullText){
-  let year=detectStatementYear(fullText),out=[],section='',pendingCheckHeader=false;
+  let year=detectStatementYear(fullText),out=[],section='';
+
   for(let raw of lines){
     let line=raw.replace(/\s+/g,' ').trim();
     if(!line)continue;
 
-    // Section detection
-    if(/^Deposits$/i.test(line)){section='credit';pendingCheckHeader=false;continue}
-    if(/^Electronic Credits$/i.test(line)){section='credit';pendingCheckHeader=false;continue}
-    if(/^Other Credits(?: \(continued\))?$/i.test(line)){section='credit';pendingCheckHeader=false;continue}
-    if(/^Electronic Debits$/i.test(line)){section='debit';pendingCheckHeader=false;continue}
-    if(/^Other Debits(?: \(continued\))?$/i.test(line)){section='debit';pendingCheckHeader=false;continue}
-    if(/^Checks Cleared$/i.test(line)){section='checks';pendingCheckHeader=true;continue}
+    if(/^Deposits$/i.test(line)){section='credit';continue}
+    if(/^Electronic Credits$/i.test(line)){section='credit';continue}
+    if(/^Other Credits(?: \(continued\))?$/i.test(line)){section='credit';continue}
+    if(/^Electronic Debits$/i.test(line)){section='debit';continue}
+    if(/^Other Debits(?: \(continued\))?$/i.test(line)){section='debit';continue}
+    if(/^Checks Cleared$/i.test(line)){section='checks';continue}
 
     if(/^(Interest Rate Changes|HOW TO BALANCE YOUR ACCOUNT|Standard Business Checking .*continued|Credit\(s\) This Period|Debits\(s\) This Period|Summary of Accounts|Account Summary|Interest Summary)$/i.test(line)){
-      section='';pendingCheckHeader=false;continue
+      section='';continue
     }
 
-    // Skip known headers/summary rows but keep check section active across repeated table headers.
-    if(/^Check Nbr Date Amount$/i.test(line) || /^Check Number Date Amount$/i.test(line)){
-      if(section==='checks') pendingCheckHeader=true;
-      continue
-    }
+    if(/^Check Nbr Date Amount$/i.test(line) || /^Check Number Date Amount$/i.test(line))continue;
     if(/^(Date\s+Description|Description\s+Items|Interest Rate As Of Date|\* Indicates|Statement Ending|Page \d+ of \d+)/i.test(line))continue;
     if(/item\(s\) totaling|Annual Percentage Yield|Interest Paid|Average Ledger Balance|Beginning Balance|Ending Balance|\bCredit\(s\) This Period\b|\bDebit\(s\) This Period\b/i.test(line))continue;
 
     if(section==='credit'||section==='debit'){
-      // Handle normal one-line transaction rows.
-      let m=line.match(/^(\d{1,2}\/\d{1,2}\/\d{4})\s+(.+?)\s+\$?([\d,]+\.\d{2})$/);
-      if(m){
-        let date=normalizeStatementDate(m[1],year),desc=m[2].trim(),amount=pdfMoney(m[3]);
+      let tm=line.match(/^(\d{1,2}\/\d{1,2}\/\d{4})\s+(.+?)\s+\$?([\d,]+\.\d{2})$/);
+      if(tm){
+        let date=normalizeStatementDate(tm[1],year),desc=tm[2].trim(),amount=pdfMoney(tm[3]);
         out.push(makePdfRow(date,desc,'',section==='credit'?'Income':'Expense',amount,line));
         continue
       }
     }
 
     if(section==='checks'){
-      // Flagstar sometimes repeats "Check Nbr Date Amount" and includes an asterisk after the number.
-      // Examples:
-      // 534 02/18/2025 $1,000.00
-      // 536* 02/04/2025 $400.00
-      // 554* 05/27/2026 $4,666.93
       let cm=line.match(/^#?0*(\d{1,8})\*?\s+(\d{1,2}\/\d{1,2}\/\d{4})\s+\$?([\d,]+\.\d{2})$/);
       if(cm){
         let ref=cm[1],date=normalizeStatementDate(cm[2],year),amount=pdfMoney(cm[3]);
         out.push(makePdfRow(date,`Check #${ref}`,ref,'Expense',amount,line));
-        pendingCheckHeader=false;
         continue
       }
     }
   }
 
-  // De-duplicate true duplicates, including check-image repeats on later pages.
+  // Robust Flagstar fallback:
+  // PDF.js can split check table text into separate positioned items so the line parser
+  // may miss the rows even though the extracted full text contains them.
+  // Scan the entire statement text for the known Flagstar check-row shape.
+  // Examples:
+  //   534 02/18/2025 $1,000.00
+  //   536* 02/04/2025 $400.00
+  //   #0534 02/18/2025 $1,000.00  (check image detail)
+  let checkRegex=/(?:^|\n|\s)#?0*(\d{3,8})\*?\s+(\d{1,2}\/\d{1,2}\/\d{4})\s+\$([\d,]+\.\d{2})(?=\s|$)/g;
+  let cm;
+  while((cm=checkRegex.exec(fullText))!==null){
+    let ref=String(parseInt(cm[1],10)),date=normalizeStatementDate(cm[2],year),amount=pdfMoney(cm[3]);
+
+    // Only accept check-like numbers in a reasonable range and avoid statement/page identifiers.
+    if(!ref || Number(ref)>99999999 || !amount)continue;
+
+    out.push(makePdfRow(date,`Check #${ref}`,ref,'Expense',amount,cm[0].trim()));
+  }
+
+  // De-duplicate transactions. For checks, number+date+amount uniquely identifies the row,
+  // which prevents page-4 check images from creating duplicate ledger candidates.
   let seen=new Set();
   return out.filter(x=>{
-    let key=x.ref?`check|${x.date}|${x.ref}|${(+x.amount).toFixed(2)}`:`tx|${x.date}|${x.type}|${x.desc}|${(+x.amount).toFixed(2)}`;
+    let key=x.ref
+      ? `check|${x.date}|${String(parseInt(x.ref,10))}|${(+x.amount).toFixed(2)}`
+      : `tx|${x.date}|${x.type}|${x.desc}|${(+x.amount).toFixed(2)}`;
     if(seen.has(key))return false;
     seen.add(key);
     return true
