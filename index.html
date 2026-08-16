@@ -256,15 +256,18 @@ function parseFlagstarTransactions(lines,fullText){
     out.push(makePdfRow(date,`Check #${ref}`,ref,'Expense',amount,cm[0].trim()));
   }
 
-  // De-duplicate transactions. For checks, number+date+amount uniquely identifies the row,
-  // which prevents page-4 check images from creating duplicate ledger candidates.
-  let seen=new Set();
+  // De-duplicate CHECKS ONLY.
+  // Flagstar repeats check details on later check-image pages, so checks are uniquely
+  // identified by check number + date + amount.
+  // Ordinary bank transactions are NEVER de-duplicated merely because date,
+  // description, and amount are identical. Legitimate duplicate purchases/deposits
+  // must remain separate ledger candidates.
+  let seenChecks=new Set();
   return out.filter(x=>{
-    let key=x.ref
-      ? `check|${x.date}|${String(parseInt(x.ref,10))}|${(+x.amount).toFixed(2)}`
-      : `tx|${x.date}|${x.type}|${x.desc}|${(+x.amount).toFixed(2)}`;
-    if(seen.has(key))return false;
-    seen.add(key);
+    if(!x.ref)return true;
+    let key=`check|${x.date}|${String(parseInt(x.ref,10))}|${(+x.amount).toFixed(2)}`;
+    if(seenChecks.has(key))return false;
+    seenChecks.add(key);
     return true
   })
 }
