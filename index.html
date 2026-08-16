@@ -196,7 +196,67 @@ function normalizeStatementDate(s,year){let m=s.match(/^(\d{1,2})[\/-](\d{1,2})(
 function pdfMoney(v){if(v==null)return 0;return Math.abs(parseFloat(String(v).replace(/[$,\s]/g,'').replace(/[()]/g,''))||0)}
 function parseFlagstarMeta(fullText){if(!/Flagstar Bank|www\.flagstar\.com|HICKSVILLE/i.test(fullText))return null;let grab=(re,i=1)=>{let m=fullText.match(re);return m?m[i]:null},begin=grab(/Beginning Balance\s+\$?([\d,]+\.\d{2})/i),end=grab(/Ending Balance\s+\$?([\d,]+\.\d{2})/i),cr=fullText.match(/(\d+)\s+Credit\(s\)\s+This Period\s+\$?([\d,]+\.\d{2})/i),dr=fullText.match(/(\d+)\s+Debit\(s\)\s+This Period\s+\$?([\d,]+\.\d{2})/i),period=grab(/Statement Ending\s+(\d{2}\/\d{2}\/\d{4})/i),bd=fullText.match(/(\d{2}\/\d{2}\/\d{4})\s+Beginning Balance/i),ed=fullText.match(/(\d{2}\/\d{2}\/\d{4})\s+Ending Balance/i),iso=s=>s?`${s.slice(6,10)}-${s.slice(0,2)}-${s.slice(3,5)}`:'';if(!cr||!dr)return null;return{bank:'Flagstar Bank',period:period?`Statement Ending ${period}`:'Flagstar Statement',beginningDate:iso(bd?.[1]||''),endingDate:iso(ed?.[1]||period||''),beginningBalance:pdfMoney(begin),endingBalance:pdfMoney(end),expected:{creditCount:+cr[1],creditTotal:pdfMoney(cr[2]),debitCount:+dr[1],debitTotal:pdfMoney(dr[2])}}}
 function makePdfRow(date,desc,ref,type,amount,raw){let fp=fingerprint(date,desc,amount),category=type==='Income'?(db.categories.Income.includes('Uncategorized Income')?'Uncategorized Income':db.categories.Income[0]):(db.categories.Expense.includes('Uncategorized Expense')?'Uncategorized Expense':db.categories.Expense[0]);return{id:'pdf'+Math.random().toString(36).slice(2,9),date,desc,ref:ref||'',type,amount,category,event:'',approve:amount>0,duplicate:db.fingerprints.includes(fp),fp,raw}}
-function parseFlagstarTransactions(lines,fullText){let year=detectStatementYear(fullText),out=[],section='',pending=null;let normalizeSection=s=>s.replace(/ \(continued\)$/i,''),sectionType=s=>['Deposits','Electronic Credits','Other Credits'].includes(s)?'Income':['Electronic Debits','Other Debits','Returned Items','Return Items'].includes(s)?'Expense':s==='Checks Cleared'?'Check':'',isHeader=line=>/^(Deposits|Electronic Credits|Other Credits|Electronic Debits|Other Debits|Returned Items|Return Items|Checks Cleared)(?: \(continued\))?$/i.test(line),flush=()=>{if(!pending)return;let line=pending.join(' ').replace(/\s+/g,' ').trim(),m=line.match(/^(\d{1,2}\/\d{1,2}\/\d{4})\s+(.+?)\s+\$?([\d,]+\.\d{2})$/);if(m){let type=sectionType(section);if(type==='Income'||type==='Expense')out.push(makePdfRow(normalizeStatementDate(m[1],year),m[2].trim(),'',type,pdfMoney(m[3]),line))}pending=null};for(let raw of lines){let line=raw.replace(/\s+/g,' ').trim();if(!line)continue;if(isHeader(line)){flush();section=normalizeSection(line);continue}if(/^(Interest Rate Changes|HOW TO BALANCE YOUR ACCOUNT|Standard Business Checking .*continued|Credit\(s\) This Period|Debits\(s\) This Period|Summary of Accounts|Account Summary|Interest Summary|BUSINESS DISCLOSURE UPDATES|U\.S\. Consumer Privacy Notice)$/i.test(line)){flush();section='';continue}if(/^(Date\s+Description|Description\s+Items|Check Nbr(?:\s+Date\s+Amount)?|Interest Rate As Of Date|\* Indicates|Statement Ending|Page \d+ of \d+)/i.test(line))continue;if(/item\(s\) totaling|Annual Percentage Yield|Interest Paid|Average Ledger Balance|Beginning Balance|Ending Balance|\bCredit\(s\) This Period\b|\bDebit\(s\) This Period\b/i.test(line))continue;if(section==='Checks Cleared'){flush();let m=line.match(/^#?0*(\d{1,8})\*?\s+(\d{1,2}\/\d{1,2}\/\d{4})\s+\$?([\d,]+\.\d{2})$/);if(m)out.push(makePdfRow(normalizeStatementDate(m[2],year),`Check #${m[1]}`,m[1],'Expense',pdfMoney(m[3]),line));continue}let st=sectionType(section);if(st==='Income'||st==='Expense'){if(/^\d{1,2}\/\d{1,2}\/\d{4}\s+/.test(line)){flush();pending=[line]}else if(pending){pending.push(line)}if(pending&&/\$?[\d,]+\.\d{2}$/.test(pending[pending.length-1]))flush();continue}}flush();let seen=new Set();return out.filter(x=>{let k=fingerprint(x.date,x.ref||x.desc,x.amount);if(seen.has(k))return false;seen.add(k);return true})}
+function parseFlagstarTransactions(lines,fullText){
+  let year=detectStatementYear(fullText),out=[],section='',pendingCheckHeader=false;
+  for(let raw of lines){
+    let line=raw.replace(/\s+/g,' ').trim();
+    if(!line)continue;
+
+    // Section detection
+    if(/^Deposits$/i.test(line)){section='credit';pendingCheckHeader=false;continue}
+    if(/^Electronic Credits$/i.test(line)){section='credit';pendingCheckHeader=false;continue}
+    if(/^Other Credits(?: \(continued\))?$/i.test(line)){section='credit';pendingCheckHeader=false;continue}
+    if(/^Electronic Debits$/i.test(line)){section='debit';pendingCheckHeader=false;continue}
+    if(/^Other Debits(?: \(continued\))?$/i.test(line)){section='debit';pendingCheckHeader=false;continue}
+    if(/^Checks Cleared$/i.test(line)){section='checks';pendingCheckHeader=true;continue}
+
+    if(/^(Interest Rate Changes|HOW TO BALANCE YOUR ACCOUNT|Standard Business Checking .*continued|Credit\(s\) This Period|Debits\(s\) This Period|Summary of Accounts|Account Summary|Interest Summary)$/i.test(line)){
+      section='';pendingCheckHeader=false;continue
+    }
+
+    // Skip known headers/summary rows but keep check section active across repeated table headers.
+    if(/^Check Nbr Date Amount$/i.test(line) || /^Check Number Date Amount$/i.test(line)){
+      if(section==='checks') pendingCheckHeader=true;
+      continue
+    }
+    if(/^(Date\s+Description|Description\s+Items|Interest Rate As Of Date|\* Indicates|Statement Ending|Page \d+ of \d+)/i.test(line))continue;
+    if(/item\(s\) totaling|Annual Percentage Yield|Interest Paid|Average Ledger Balance|Beginning Balance|Ending Balance|\bCredit\(s\) This Period\b|\bDebit\(s\) This Period\b/i.test(line))continue;
+
+    if(section==='credit'||section==='debit'){
+      // Handle normal one-line transaction rows.
+      let m=line.match(/^(\d{1,2}\/\d{1,2}\/\d{4})\s+(.+?)\s+\$?([\d,]+\.\d{2})$/);
+      if(m){
+        let date=normalizeStatementDate(m[1],year),desc=m[2].trim(),amount=pdfMoney(m[3]);
+        out.push(makePdfRow(date,desc,'',section==='credit'?'Income':'Expense',amount,line));
+        continue
+      }
+    }
+
+    if(section==='checks'){
+      // Flagstar sometimes repeats "Check Nbr Date Amount" and includes an asterisk after the number.
+      // Examples:
+      // 534 02/18/2025 $1,000.00
+      // 536* 02/04/2025 $400.00
+      // 554* 05/27/2026 $4,666.93
+      let cm=line.match(/^#?0*(\d{1,8})\*?\s+(\d{1,2}\/\d{1,2}\/\d{4})\s+\$?([\d,]+\.\d{2})$/);
+      if(cm){
+        let ref=cm[1],date=normalizeStatementDate(cm[2],year),amount=pdfMoney(cm[3]);
+        out.push(makePdfRow(date,`Check #${ref}`,ref,'Expense',amount,line));
+        pendingCheckHeader=false;
+        continue
+      }
+    }
+  }
+
+  // De-duplicate true duplicates, including check-image repeats on later pages.
+  let seen=new Set();
+  return out.filter(x=>{
+    let key=x.ref?`check|${x.date}|${x.ref}|${(+x.amount).toFixed(2)}`:`tx|${x.date}|${x.type}|${x.desc}|${(+x.amount).toFixed(2)}`;
+    if(seen.has(key))return false;
+    seen.add(key);
+    return true
+  })
+}
 function parseGenericPdfStatementLines(lines,fullText){let year=detectStatementYear(fullText),out=[];let incomeWords=/\b(deposit|credit|interest|refund|payment received|zelle.*received|transfer from|mobile deposit|remote deposit)\b/i,expenseWords=/\b(debit|purchase|withdrawal|fee|check|ach payment|card|pos|bill pay|payment to|transfer to)\b/i;for(let raw of lines){let line=raw.replace(/\s+/g,' ').trim();if(/Beginning Balance|Ending Balance|item\(s\) totaling|Credit\(s\) This Period|Debit\(s\) This Period/i.test(line))continue;let dm=line.match(/^(\d{1,2}[\/-]\d{1,2}(?:[\/-]\d{2,4})?)\s+(.+)/);if(!dm)continue;let moneyMatches=[...line.matchAll(/(?:\$\s*)?\(?-?\d{1,3}(?:,\d{3})*\.\d{2}\)?/g)];if(!moneyMatches.length)continue;let amtMatch=moneyMatches[moneyMatches.length-1],rawAmt=amtMatch[0].replace(/\$/g,'').replace(/,/g,'').replace(/\s/g,''),negative=rawAmt.startsWith('-')||(rawAmt.startsWith('(')&&rawAmt.endsWith(')')),amount=Math.abs(parseFloat(rawAmt.replace(/[()]/g,''))||0);if(!amount)continue;let type=negative?'Expense':incomeWords.test(line)?'Income':expenseWords.test(line)?'Expense':'Expense';let desc=line.slice(dm[1].length).trim().replace(amtMatch[0],' ').replace(/\s+/g,' ').trim(),ref='',cm=desc.match(/\b(?:check|chk|ref(?:erence)?)\s*#?\s*(\d{3,})\b/i);if(cm)ref=cm[1];out.push(makePdfRow(normalizeStatementDate(dm[1],year),desc||'PDF transaction',ref,type,amount,line))}return out}
 async function loadPDF(file){if(!file)return;importSource='PDF Statement';statementMeta=null;pdfStatus.textContent='Reading PDF statement…';try{if(!window.pdfjsLib){throw new Error('PDF reader library did not load. Connect to the internet and reopen BCF for this test build.')}let data=new Uint8Array(await file.arrayBuffer()),pdf=await pdfjsLib.getDocument({data}).promise,lines=[],all=[];for(let p=1;p<=pdf.numPages;p++){pdfStatus.textContent=`Reading PDF page ${p} of ${pdf.numPages}…`;let page=await pdf.getPage(p),tc=await page.getTextContent(),groups=new Map();tc.items.forEach(it=>{let y=Math.round(it.transform?.[5]||0),x=it.transform?.[4]||0;if(!groups.has(y))groups.set(y,[]);groups.get(y).push({x,s:it.str})});[...groups.entries()].sort((a,b)=>b[0]-a[0]).forEach(([y,items])=>{let line=items.sort((a,b)=>a.x-b.x).map(z=>z.s).join(' ').replace(/\s+/g,' ').trim();if(line){lines.push(line);all.push(line)}})}let fullText=all.join('\n');statementMeta=parseFlagstarMeta(fullText);importQueue=statementMeta?parseFlagstarTransactions(lines,fullText):parseGenericPdfStatementLines(lines,fullText);let recon=currentStatementRecon();pdfStatus.textContent=statementMeta?`Flagstar statement detected: ${importQueue.length} actual transaction${importQueue.length===1?'':'s'} found.${recon&&recon.ok?' Statement totals reconciled.':' Review required before final verification.'}`:`PDF extraction complete: ${pdf.numPages} page${pdf.numPages===1?'':'s'}, ${importQueue.length} possible transaction${importQueue.length===1?'':'s'} found. Review every item carefully.`;showImportStep(3);renderReviewQueue();if(!importQueue.length)alert('BCF could read the PDF text, but no transaction rows matched the parser. Upload this bank statement to Atlas so the parser can be tuned to this bank layout.')}catch(e){console.error(e);pdfStatus.textContent='PDF import could not be completed.';alert('BCF could not read this PDF statement. If it is a scanned/image-only statement, it will need OCR. If it is text-based, send the statement to Atlas so the bank-specific parser can be adjusted.\n\nTechnical detail: '+e.message)}}
 
